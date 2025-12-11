@@ -1,0 +1,7 @@
+
+ERROR ANALYSIS - Neural Network
+==================================================
+Total: 5482 | Errors: 117 (2.13%)
+FP: 39 | FN: 78
+
+TEXT LENGTH: 734 vs 662
