@@ -1,158 +1,171 @@
-import pandas as pd
+from __future__ import annotations
+
 import re
+from dataclasses import dataclass
+from pathlib import Path
+
+import pandas as pd
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
 
 
+@dataclass(frozen=True)
+class Config:
+    dataset_id: str = "KFUPM-JRCAI/arabic-generated-abstracts"
+    seed: int = 42
+
+    raw_dir: Path = Path("data/raw")
+    splits_dir: Path = Path("data/splits")
+    reports_dir: Path = Path("reports/features")
+
+    raw_file: str = "alldataset.csv"
+    train_file: str = "train.csv"
+    val_file: str = "val.csv"
+    test_file: str = "test.csv"
 
 
-# Load dataset
-def load_data():
-    ds = load_dataset("KFUPM-JRCAI/arabic-generated-abstracts")
+CFG = Config()
 
-    dfs = []
-    for split_name in ds.keys():
-        df = pd.DataFrame(ds[split_name])
-        df["split"] = split_name
-        dfs.append(df)
-
-    df_all = pd.concat(dfs, ignore_index=True)
-
-    data = []
-
-    for _, row in df_all.iterrows():
-        if isinstance(row['original_abstract'], str) and row['original_abstract'].strip():
-            data.append({'text': row['original_abstract'], 'label': 0})
-
-    for model in ['allam', 'jais', 'llama', 'openai']:
-        col = f'{model}_generated_abstract'
-        if col in df_all.columns:
-            for _, row in df_all.iterrows():
-                if isinstance(row[col], str) and row[col].strip():
-                    data.append({'text': row[col], 'label': 1})
-
-    result = pd.DataFrame(data).drop_duplicates()
-    print(f"Loaded {len(result)} samples")
-    return result
+ELONG_PATTERN = re.compile(r"([اأإآبتثجحخدذرزسشصضطظعغفقكلمنهوي])\1{2,}")
+VERB_PREFIXES = ("ي", "ت", "ن", "أ", "س")
+VERB_SUFFIXES = ("ون", "ان", "ين", "وا", "تم", "نا", "ت")
+STOPWORDS = {
+    "في", "من", "على", "إلى", "عن", "أن", "إن", "كان", "كانت",
+    "هذا", "هذه", "هو", "هي", "ما", "لا", "لم", "لن", "مع", "بين"
+}
 
 
-# Split data
-def split_data(df):
-    train, temp = train_test_split(df, test_size=0.30, random_state=42, stratify=df['label'])
-    val, test = train_test_split(temp, test_size=0.50, random_state=42, stratify=temp['label'])
-    print(f"Train: {len(train)} Val: {len(val)} Test: {len(test)}")
+def ensure_dirs(*dirs: Path) -> None:
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def save_csv(df: pd.DataFrame, path: Path, encoding: str = "utf-8-sig") -> None:
+    ensure_dirs(path.parent)
+    df.to_csv(path, index=False, encoding=encoding)
+
+
+AI_COLS = (
+    "allam_generated_abstract",
+    "jais_generated_abstract",
+    "llama_generated_abstract",
+    "openai_generated_abstract",
+)
+
+
+def fetch_raw_hf_df(dataset_id: str) -> pd.DataFrame:
+    ds = load_dataset(dataset_id)
+    frames = [ds[k].to_pandas() for k in ds.keys()]
+    return pd.concat(frames, ignore_index=True)
+
+
+def build_alldataset(df_raw: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+
+    for _, r in df_raw.iterrows():
+        if isinstance(r.get("original_abstract"), str) and r["original_abstract"].strip():
+            rows.append({"text": r["original_abstract"], "label": 0})
+
+        for col in AI_COLS:
+            v = r.get(col)
+            if isinstance(v, str) and v.strip():
+                rows.append({"text": v, "label": 1})
+
+    return pd.DataFrame(rows).drop_duplicates(ignore_index=True)
+
+
+def split_70_15_15(df: pd.DataFrame, seed: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    train, temp = train_test_split(
+        df, test_size=0.30, random_state=seed, stratify=df["label"]
+    )
+    val, test = train_test_split(
+        temp, test_size=0.50, random_state=seed, stratify=temp["label"]
+    )
     return train, val, test
 
 
-# Arabic patterns
-ELONG_PATTERN = re.compile(r'([اأإآبتثجحخدذرزسشصضطظعغفقكلمنهوي])\1{2,}')
-VERB_PREFIXES = ('ي', 'ت', 'ن', 'أ', 'س')
-VERB_SUFFIXES = ('ون', 'ان', 'ين', 'وا', 'تم', 'نا', 'ت')
-STOPWORDS = {'في', 'من', 'على', 'إلى', 'عن', 'أن', 'إن', 'كان', 'هذا', 'هذه', 'هو', 'هي', 'ما', 'لا'}
+def clean_ar(word: str) -> str:
+    return re.sub(r"[^\u0600-\u06FF]+", "", word)
 
 
-def clean_arabic(word):
-    return re.sub(r'[^\u0600-\u06FF]+', '', word)
-
-
-def is_verb(word):
-    w = clean_arabic(word)
+def is_verb(word: str) -> bool:
+    w = clean_ar(word)
     return len(w) >= 3 and (w.startswith(VERB_PREFIXES) or any(w.endswith(s) for s in VERB_SUFFIXES))
 
 
-def is_dual(word):
-    w = clean_arabic(word)
-    return len(w) >= 4 and (w.endswith('ان') or w.endswith('ين'))
+def is_dual(word: str) -> bool:
+    w = clean_ar(word)
+    return len(w) >= 4 and (w.endswith("ان") or w.endswith("ين"))
 
 
-# Feature 1: elongations
-def count_elongations(text):
-    if not isinstance(text, str):
-        return 0
-    return sum(1 for w in text.split() if ELONG_PATTERN.search(w))
+def feat_elongations(text: str) -> int:
+    return sum(1 for w in str(text).split() if ELONG_PATTERN.search(w))
 
 
-# Feature 2: periods
-def count_periods(text):
-    if not isinstance(text, str):
-        return 0
-    return text.count('.')
+def feat_periods(text: str) -> int:
+    return str(text).count(".")
 
 
-# Feature 3: verbs
-def count_verbs(text):
-    if not isinstance(text, str):
-        return 0
-    return sum(1 for w in text.split() if is_verb(w))
+def feat_verbs(text: str) -> int:
+    return sum(1 for w in str(text).split() if is_verb(w))
 
 
-# Feature 4: dual words
-def count_dual_words(text):
-    if not isinstance(text, str):
-        return 0
-    return sum(1 for w in text.split() if is_dual(w))
+def feat_duals(text: str) -> int:
+    return sum(1 for w in str(text).split() if is_dual(w))
 
 
-# Feature 5: entity diversity
-def extract_entities(text):
-    if not isinstance(text, str):
-        return []
-
+def feat_entity_diversity(text: str) -> float:
     entities = []
-    for w in text.split():
-        clean = clean_arabic(w)
-        if len(clean) >= 4:
-            if (clean.startswith('ال') and clean not in STOPWORDS) or (len(clean) >= 6 and not is_verb(clean)):
-                entities.append(clean)
-    return entities
+    for w in str(text).split():
+        c = clean_ar(w)
+        if len(c) >= 4 and c not in STOPWORDS and not is_verb(c):
+            entities.append(c)
+    return (len(set(entities)) / len(entities)) if entities else 0.0
 
 
-def entity_diversity(text):
-    entities = extract_entities(text)
-    return len(set(entities)) / len(entities) if entities else 0.0
+def write_feature_reports(train: pd.DataFrame, val: pd.DataFrame, out_dir: Path) -> None:
+    ensure_dirs(out_dir)
+    df = pd.concat([train, val], ignore_index=True)
+
+    pd.DataFrame({"feat_multi_elong_count": df["text"].apply(feat_elongations)}).to_csv(
+        out_dir / "feature1_elongations.csv", index=False
+    )
+    pd.DataFrame({"feat_num_periods": df["text"].apply(feat_periods)}).to_csv(
+        out_dir / "feature2_periods.csv", index=False
+    )
+    pd.DataFrame({"feat_num_verbs": df["text"].apply(feat_verbs)}).to_csv(
+        out_dir / "feature3_verbs.csv", index=False
+    )
+    pd.DataFrame({"feat_num_dual_words": df["text"].apply(feat_duals)}).to_csv(
+        out_dir / "feature4_dual_words.csv", index=False
+    )
+    pd.DataFrame({"feat_entity_diversity": df["text"].apply(feat_entity_diversity)}).to_csv(
+        out_dir / "feature5_entity_diversity.csv", index=False
+    )
 
 
-# Extract features
-def add_features(df):
-    df = df.copy()
-    df['multiple_elongations'] = df['text'].apply(count_elongations)
-    df['periods'] = df['text'].apply(count_periods)
-    df['verbs'] = df['text'].apply(count_verbs)
-    df['dual_words'] = df['text'].apply(count_dual_words)
-    df['entity_diversity'] = df['text'].apply(entity_diversity)
-    return df
+def main() -> None:
+    ensure_dirs(CFG.raw_dir, CFG.splits_dir, CFG.reports_dir)
 
+    print("Fetching dataset")
+    raw_df = fetch_raw_hf_df(CFG.dataset_id)
 
-# Save results
-def save_all(train, val, test):
-    train.to_csv('data/processed/train.csv', index=False)
-    val.to_csv('data/processed/val.csv', index=False)
-    test.to_csv('data/processed/test.csv', index=False)
+    print("Building dataset")
+    alldataset = build_alldataset(raw_df)
+    save_csv(alldataset, CFG.raw_dir / CFG.raw_file)
+    print(f"Saved: {CFG.raw_dir / CFG.raw_file} shape={alldataset.shape}")
 
-    features = ['multiple_elongations', 'periods', 'verbs', 'dual_words', 'entity_diversity']
+    print("Splitting data")
+    train, val, test = split_70_15_15(alldataset, CFG.seed)
 
-    summary = f"Train: {len(train)} samples\n"
-    summary += f"Val: {len(val)} samples\n"
-    summary += f"Test: {len(test)} samples\n\n"
+    save_csv(train, CFG.splits_dir / CFG.train_file)
+    save_csv(val, CFG.splits_dir / CFG.val_file)
+    save_csv(test, CFG.splits_dir / CFG.test_file)
 
-    for col in features:
-        h = train[train['label'] == 0][col].mean()
-        a = train[train['label'] == 1][col].mean()
-        summary += f"{col}: Human={h} AI={a}\n"
-
-    with open('reports/phase3_summary.txt', 'w', encoding='utf-8') as f:
-        f.write(summary)
-
-    print(summary)
-
-
-def main():
-    df = load_data()
-    train, val, test = split_data(df)
-    train = add_features(train)
-    val = add_features(val)
-    test = add_features(test)
-    save_all(train, val, test)
+    print(f"Train: {train.shape} Val: {val.shape} Test: {test.shape}")
+    print("Writing features")
+    write_feature_reports(train, val, CFG.reports_dir)
+    print(f"Reports saved: {CFG.reports_dir}")
 
 
 if __name__ == "__main__":
