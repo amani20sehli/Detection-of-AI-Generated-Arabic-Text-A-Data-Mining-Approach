@@ -2,9 +2,8 @@ import pandas as pd
 import re
 from datasets import load_dataset
 from sklearn.model_selection import train_test_split
-import warnings
 
-warnings.filterwarnings('ignore')
+
 
 
 # Load dataset
